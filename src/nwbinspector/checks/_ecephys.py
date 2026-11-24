@@ -1,8 +1,11 @@
 """Check functions specific to extracellular electrophysiology neurodata types."""
 
+import re
+from collections import Counter
 from typing import Iterable, Optional
 
 import numpy as np
+from hdmf.common import DynamicTableRegion, VectorIndex
 from pynwb import NWBFile
 from pynwb.ecephys import ElectricalSeries, SpikeEventSeries
 from pynwb.misc import Units
@@ -477,4 +480,243 @@ def check_electrodes_location_allen_ccf(nwbfile: NWBFile) -> Optional[Iterable[I
                 )
             )
 
+    return None
+
+
+def _get_units_electrodes(units_table: Units) -> Optional[tuple]:
+    """Return (flat row indices, end offsets, DynamicTableRegion) for the units' electrodes column, or None."""
+    if "electrodes" not in units_table.colnames:
+        return None
+    column = units_table["electrodes"]
+    if isinstance(column, VectorIndex):
+        ends = np.asarray(column.data[:], dtype=np.int64)
+        region = column.target
+    else:
+        region = column
+        ends = None
+    if not isinstance(region, DynamicTableRegion) or region.table is None:
+        return None
+    flat = np.asarray(region.data[:], dtype=np.int64)
+    if ends is None:
+        ends = np.arange(1, len(flat) + 1)
+    return flat, ends, region
+
+
+def _get_group_names(groups: Iterable) -> np.ndarray:
+    return np.array([getattr(group, "name", str(group)) for group in groups], dtype=object)
+
+
+@register_check(importance=Importance.CRITICAL, neurodata_type=Units)
+def check_units_electrode_group_matches_electrodes(units_table: Units) -> Optional[InspectorMessage]:
+    """
+    Check that each unit's electrode_group is the group of at least one electrode row that its electrodes reference.
+
+    Best Practice: :ref:`best_practice_units_electrodes_consistency`
+    """
+    if "electrode_group" not in units_table.colnames:
+        return None
+    parsed = _get_units_electrodes(units_table)
+    if parsed is None:
+        return None
+    flat, ends, region = parsed
+    electrodes_table = region.table
+    if "group" not in electrodes_table.colnames or len(ends) == 0:
+        return None
+
+    row_groups = _get_group_names(electrodes_table["group"].data[:])
+    unit_groups = _get_group_names(units_table["electrode_group"].data[:])
+    n_rows = len(row_groups)
+    unit_ids = units_table.id.data[:]
+
+    mismatches = []  # (unit position, unit group, referenced groups, referenced rows)
+    n_checked = 0
+    start = 0
+    for unit_index, end in enumerate(ends):
+        rows = flat[start:end]
+        start = end
+        # Out-of-range indices are reported by check_dynamic_table_region_data_validity
+        rows = rows[(rows >= 0) & (rows < n_rows)]
+        if rows.size == 0:
+            continue
+        n_checked += 1
+        referenced_groups = set(row_groups[rows])
+        if unit_groups[unit_index] not in referenced_groups:
+            mismatches.append((unit_index, unit_groups[unit_index], sorted(referenced_groups), rows))
+
+    if not mismatches:
+        return None
+
+    pairs = Counter((unit_group, ", ".join(referenced)) for _, unit_group, referenced, _ in mismatches)
+    pair_text = "; ".join(
+        f"{count} unit(s) with electrode_group '{unit_group}' reference rows of group '{referenced}'"
+        for (unit_group, referenced), count in pairs.most_common(4)
+    )
+    examples = "; ".join(
+        f"unit id {unit_ids[unit_index]}: electrode_group '{unit_group}', electrodes rows "
+        f"{[int(row) for row in rows[:4]]}{'...' if rows.size > 4 else ''}"
+        for unit_index, unit_group, _, rows in mismatches[:3]
+    )
+    permuted = ""
+    labels = {unit_group for unit_group, _ in pairs}
+    targets = {referenced for _, referenced in pairs}
+    if len(labels) > 1 and labels == targets:
+        permuted = " The group labels look permuted, as if the two columns were built in different orders."
+    return InspectorMessage(
+        message=(
+            f"{len(mismatches)} of {n_checked} units have an electrode_group that is not the group of any "
+            f"electrode row referenced by their electrodes column, so the two columns disagree about where these "
+            f"units were recorded. {pair_text}.{permuted} Examples: {examples}."
+        )
+    )
+
+
+def _get_max_group_number(names: Iterable) -> int:
+    """
+    Return the largest number in names such as 'Tetrode12', or 0 if the names are not of that form.
+
+    Every name must contain exactly one integer, so ranges such as '1-8' and names without a number are ignored.
+    """
+    numbers = [re.findall(r"\d+", name.decode() if isinstance(name, bytes) else str(name)) for name in names]
+    if not numbers or any(len(found) != 1 for found in numbers):
+        return 0
+    return max(int(found[0]) for found in numbers)
+
+
+@register_check(importance=Importance.BEST_PRACTICE_VIOLATION, neurodata_type=Units)
+def check_units_electrodes_look_like_group_numbers(
+    units_table: Units,
+    min_rows_per_group: float = 2.0,
+    min_distinct_values: int = 3,
+    max_fraction_of_rows: float = 0.75,
+) -> Optional[InspectorMessage]:
+    """
+    Check that the units' electrodes column holds electrodes table row indices rather than group numbers.
+
+    A common conversion mistake is to write the tetrode or shank number of each unit into the electrodes column.
+    This check reports a column where every unit references a single row, the values never exceed the number of
+    electrode groups (or the largest number in the group names, since group numbering can skip), at least
+    ``min_distinct_values`` distinct values are used, the electrodes table has at least ``min_rows_per_group``
+    rows per group, and all values fall within the first ``max_fraction_of_rows`` of the table. When the Units
+    table also has an electrode_group column, the check only reports the column if the values agree with the
+    units' groups better when read as group numbers than when read as row indices.
+
+    Best Practice: :ref:`best_practice_units_electrodes_consistency`
+    """
+    parsed = _get_units_electrodes(units_table)
+    if parsed is None:
+        return None
+    flat, ends, region = parsed
+    electrodes_table = region.table
+    if flat.size == 0 or "group" not in electrodes_table.colnames:
+        return None
+
+    row_groups = _get_group_names(electrodes_table["group"].data[:])
+    n_rows = len(row_groups)
+    group_order = list(dict.fromkeys(row_groups))
+    n_groups = len(group_order)
+    if n_rows < 8 or n_rows < min_rows_per_group * n_groups:
+        return None
+    rows_per_unit = np.diff(np.concatenate([[0], ends]))
+    if rows_per_unit.max() > 1:
+        return None
+
+    max_group_number = _get_max_group_number(group_order)
+    for column_name in ("label", "group_name"):
+        if column_name in electrodes_table.colnames:
+            values = electrodes_table[column_name].data[:]
+            # Only use columns that name groups of rows, not per-channel labels
+            if len(set(values)) <= n_rows / min_rows_per_group:
+                max_group_number = max(max_group_number, _get_max_group_number(values))
+    group_limit = max(n_groups, max_group_number)
+    if np.unique(flat).size < min_distinct_values or flat.min() < 0 or flat.max() > group_limit:
+        return None
+    if flat.max() + 1 > max_fraction_of_rows * n_rows:
+        return None
+
+    evidence = ""
+    if "electrode_group" in units_table.colnames:
+        unit_groups = _get_group_names(units_table["electrode_group"].data[:])
+        agreement_as_rows = np.mean(row_groups[flat] == unit_groups)
+        group_position = {name: position for position, name in enumerate(group_order)}
+        unit_positions = np.array([group_position.get(group, -10) for group in unit_groups])
+        agreement_as_numbers = max(np.mean(flat == unit_positions), np.mean(flat == unit_positions + 1))
+        if agreement_as_numbers <= agreement_as_rows:
+            return None
+        evidence = (
+            f" Read as group numbers, the values agree with the units' electrode_group for "
+            f"{agreement_as_numbers:.0%} of units; read as row indices, for {agreement_as_rows:.0%}."
+        )
+
+    numbered_up_to = f", numbered up to {max_group_number}" if max_group_number > n_groups else ""
+    return InspectorMessage(
+        message=(
+            f"The units' electrodes column should hold row indices of the electrodes table ({n_rows} rows), but its "
+            f"values only run from {flat.min()} to {flat.max()}, within the number of electrode groups "
+            f"({n_groups}{numbered_up_to}). It may hold group numbers (for example, tetrode or shank numbers) "
+            f"instead of row indices. Read as row indices, they place every unit on the first {flat.max() + 1} "
+            f"rows.{evidence}"
+        )
+    )
+
+
+def _get_electrodes_float_column(nwbfile: NWBFile, column_name: str) -> Optional[np.ndarray]:
+    if nwbfile.electrodes is None or column_name not in nwbfile.electrodes.colnames:
+        return None
+    try:
+        values = np.asarray(nwbfile.electrodes[column_name].data[:], dtype=float)
+    except (TypeError, ValueError):
+        return None
+    return values if values.ndim == 1 else None
+
+
+@register_check(importance=Importance.CRITICAL, neurodata_type=NWBFile)
+def check_electrodes_identical_coordinate_columns(
+    nwbfile: NWBFile, min_rows: int = 4
+) -> Optional[Iterable[InspectorMessage]]:
+    """
+    Check that no two coordinate columns of the electrodes table are identical while varying across rows.
+
+    Compares x, y and z with each other, and rel_x, rel_y and rel_z with each other. Columns that are constant or
+    have fewer than ``min_rows`` finite values are skipped.
+
+    Best Practice: :ref:`best_practice_ecephys_anatomical_coordinates`
+    """
+    for triplet in (("x", "y", "z"), ("rel_x", "rel_y", "rel_z")):
+        columns = {name: _get_electrodes_float_column(nwbfile, name) for name in triplet}
+        columns = {name: values for name, values in columns.items() if values is not None}
+        names = list(columns)
+        for index, first in enumerate(names):
+            for second in names[index + 1 :]:
+                first_values, second_values = columns[first], columns[second]
+                finite = np.isfinite(first_values)
+                if finite.sum() < min_rows or np.unique(first_values[finite]).size < 2:
+                    continue
+                if np.array_equal(first_values, second_values, equal_nan=True):
+                    yield InspectorMessage(
+                        message=(
+                            f"The electrodes table's '{first}' and '{second}' columns are identical on all "
+                            f"{len(first_values)} rows, which suggests that one was written in place of the other "
+                            "and one coordinate is missing."
+                        )
+                    )
+    return None
+
+
+@register_check(importance=Importance.BEST_PRACTICE_VIOLATION, neurodata_type=NWBFile)
+def check_electrodes_placeholder_coordinates(nwbfile: NWBFile, min_rows: int = 2) -> Optional[InspectorMessage]:
+    """
+    Check that x, y and z of the electrodes table are not 0 on every row.
+
+    Best Practice: :ref:`best_practice_ecephys_anatomical_coordinates`
+    """
+    columns = [_get_electrodes_float_column(nwbfile, name) for name in ("x", "y", "z")]
+    if any(values is None for values in columns) or len(columns[0]) < min_rows:
+        return None
+    if all(np.all(values == 0) for values in columns):
+        return InspectorMessage(
+            message=(
+                f"The electrodes table's x, y and z are 0 on all {len(columns[0])} rows. If the positions are unknown, "
+                "use NaN (or omit the columns) so that 0 is not read as a real coordinate."
+            )
+        )
     return None

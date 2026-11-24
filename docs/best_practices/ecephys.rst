@@ -48,6 +48,13 @@ coordinates within the Subject. For mice, use the
 :allen-brain-map:`Allen Institute Common Coordinate Framework v3 <atlas>`, which follows the convention
 (+x = posterior, +y = inferior, +z = subject's right).
 
+If the coordinates of an electrode are unknown, leave them as NaN (or omit the columns) rather than writing 0, which
+is a valid coordinate. Each coordinate column should hold its own values: two columns that are identical on every row
+usually mean that one column was written in place of another.
+
+Check functions: :py:meth:`~nwbinspector.checks._ecephys.check_electrodes_placeholder_coordinates`,
+:py:meth:`~nwbinspector.checks._ecephys.check_electrodes_identical_coordinate_columns`
+
 
 
 .. _best_practice_ecephys_relative_coordinates:
@@ -82,6 +89,21 @@ certainly an error or a misuse of the neurodata type — for example, storing on
 without the underlying spike data that gives them meaning. Always include ``spike_times`` when creating a Units table.
 
 Check function: :py:meth:`~nwbinspector.checks._ecephys.check_units_table_has_spikes`
+
+
+.. _best_practice_units_electrodes_consistency:
+
+Electrodes of Each Unit
+~~~~~~~~~~~~~~~~~~~~~~~
+
+The ``electrodes`` column of the Units table holds, for each unit, the row indices of the electrodes table on which
+the unit was recorded. These are row indices, not channel numbers or electrode group (for example, tetrode or shank)
+numbers. When the Units table also has an ``electrode_group`` column, the group of each unit should be the group of
+at least one of the electrodes it references. A disagreement between the two columns usually means that one of them
+was built in a different order from the electrodes table.
+
+Check functions: :py:meth:`~nwbinspector.checks._ecephys.check_units_electrode_group_matches_electrodes`,
+:py:meth:`~nwbinspector.checks._ecephys.check_units_electrodes_look_like_group_numbers`
 
 
 .. _best_practice_units_table_duration:

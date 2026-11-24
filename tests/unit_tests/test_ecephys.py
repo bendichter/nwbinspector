@@ -16,11 +16,15 @@ from nwbinspector.checks import (
     check_electrical_series_dims,
     check_electrical_series_reference_electrodes_table,
     check_electrical_series_unscaled_data,
+    check_electrodes_identical_coordinate_columns,
     check_electrodes_location_allen_ccf,
+    check_electrodes_placeholder_coordinates,
     check_negative_spike_times,
     check_spike_times_not_in_samples,
     check_spike_times_not_in_unobserved_interval,
     check_spike_times_without_nans,
+    check_units_electrode_group_matches_electrodes,
+    check_units_electrodes_look_like_group_numbers,
     check_units_resolution_is_set,
     check_units_resolution_is_valid,
     check_units_table_duration,
@@ -897,3 +901,199 @@ def test_skip_check_electrodes_location_allen_ccf_no_subject():
         species=None,
     )
     assert check_electrodes_location_allen_ccf(nwbfile) is None
+
+
+def _make_nwbfile_with_electrode_groups(
+    n_groups=4, rows_per_group=4, group_names=None, coordinates=None, labels=None
+) -> tuple:
+    nwbfile = NWBFile(
+        session_description="test",
+        identifier=str(uuid4()),
+        session_start_time=datetime.now().astimezone(),
+    )
+    device = nwbfile.create_device(name="probe")
+    group_names = group_names or [f"Tetrode{index + 1}" for index in range(n_groups)]
+    groups = [
+        nwbfile.create_electrode_group(name=name, description="", location="CA1", device=device) for name in group_names
+    ]
+    if labels is not None:
+        nwbfile.add_electrode_column(name="label", description="label")
+    for group_index, group in enumerate(groups):
+        for offset in range(rows_per_group):
+            row = group_index * rows_per_group + offset
+            x, y, z = coordinates(row) if coordinates else (float(row), float(2 * row), float(3 * row))
+            kwargs = dict(label=labels[row]) if labels is not None else dict()
+            nwbfile.add_electrode(group=group, location="CA1", x=x, y=y, z=z, **kwargs)
+    return nwbfile, groups
+
+
+def test_check_units_electrode_group_matches_electrodes_pass():
+    nwbfile, groups = _make_nwbfile_with_electrode_groups()
+    for group_index, group in enumerate(groups):
+        nwbfile.add_unit(spike_times=[0.1], electrodes=[4 * group_index, 4 * group_index + 1], electrode_group=group)
+    assert check_units_electrode_group_matches_electrodes(units_table=nwbfile.units) is None
+
+
+def test_check_units_electrode_group_matches_electrodes_unit_spanning_two_groups_pass():
+    nwbfile, groups = _make_nwbfile_with_electrode_groups(n_groups=2)
+    nwbfile.add_unit(spike_times=[0.1], electrodes=[3, 4], electrode_group=groups[1])
+    assert check_units_electrode_group_matches_electrodes(units_table=nwbfile.units) is None
+
+
+def test_check_units_electrode_group_matches_electrodes_no_electrode_group_column_pass():
+    nwbfile, _ = _make_nwbfile_with_electrode_groups(n_groups=2)
+    nwbfile.add_unit(spike_times=[0.1], electrodes=[0])
+    assert check_units_electrode_group_matches_electrodes(units_table=nwbfile.units) is None
+
+
+def test_check_units_electrode_group_matches_electrodes_fail():
+    nwbfile, groups = _make_nwbfile_with_electrode_groups(n_groups=2)
+    nwbfile.add_unit(spike_times=[0.1], electrodes=[0], electrode_group=groups[1])
+    nwbfile.add_unit(spike_times=[0.1], electrodes=[5], electrode_group=groups[0])
+    nwbfile.add_unit(spike_times=[0.1], electrodes=[6], electrode_group=groups[1])
+    result = check_units_electrode_group_matches_electrodes(units_table=nwbfile.units)
+    assert result == InspectorMessage(
+        message=(
+            "2 of 3 units have an electrode_group that is not the group of any electrode row referenced by their "
+            "electrodes column, so the two columns disagree about where these units were recorded. "
+            "1 unit(s) with electrode_group 'Tetrode2' reference rows of group 'Tetrode1'; "
+            "1 unit(s) with electrode_group 'Tetrode1' reference rows of group 'Tetrode2'. "
+            "The group labels look permuted, as if the two columns were built in different orders. "
+            "Examples: unit id 0: electrode_group 'Tetrode2', electrodes rows [0]; "
+            "unit id 1: electrode_group 'Tetrode1', electrodes rows [5]."
+        ),
+        importance=Importance.CRITICAL,
+        check_function_name="check_units_electrode_group_matches_electrodes",
+        object_type="Units",
+        object_name="units",
+    )
+
+
+def test_check_units_electrodes_look_like_group_numbers_fail():
+    nwbfile, _ = _make_nwbfile_with_electrode_groups(n_groups=8)  # 32 rows
+    for value in [1, 3, 4, 6, 8, 8, 2]:
+        nwbfile.add_unit(spike_times=[0.1], electrodes=[value])
+    result = check_units_electrodes_look_like_group_numbers(units_table=nwbfile.units)
+    assert result == InspectorMessage(
+        message=(
+            "The units' electrodes column should hold row indices of the electrodes table (32 rows), but its values "
+            "only run from 1 to 8, within the number of electrode groups (8). It may hold group numbers (for example, "
+            "tetrode or shank numbers) instead of row indices. Read as row indices, they place every unit on the "
+            "first 9 rows."
+        ),
+        importance=Importance.BEST_PRACTICE_VIOLATION,
+        check_function_name="check_units_electrodes_look_like_group_numbers",
+        object_type="Units",
+        object_name="units",
+    )
+
+
+def test_check_units_electrodes_look_like_group_numbers_skipped_numbering_fail():
+    group_names = [f"tetrode{number}" for number in range(1, 25, 2)]  # 12 groups numbered up to 23
+    nwbfile, groups = _make_nwbfile_with_electrode_groups(group_names=group_names)  # 48 rows
+    for number in [3, 9, 15, 21, 23]:
+        nwbfile.add_unit(spike_times=[0.1], electrodes=[number])
+    result = check_units_electrodes_look_like_group_numbers(units_table=nwbfile.units)
+    assert result is not None
+    assert "numbered up to 23" in result.message
+
+
+def test_check_units_electrodes_look_like_group_numbers_with_electrode_group_fail():
+    nwbfile, groups = _make_nwbfile_with_electrode_groups(n_groups=8)
+    for number in [1, 3, 4, 6, 8]:
+        nwbfile.add_unit(spike_times=[0.1], electrodes=[number], electrode_group=groups[number - 1])
+    result = check_units_electrodes_look_like_group_numbers(units_table=nwbfile.units)
+    assert result is not None
+    assert "agree with the units' electrode_group for 100% of units" in result.message
+
+
+def test_check_units_electrodes_look_like_group_numbers_spread_rows_pass():
+    nwbfile, _ = _make_nwbfile_with_electrode_groups(n_groups=8)
+    for value in [1, 5, 9, 14, 22, 30]:
+        nwbfile.add_unit(spike_times=[0.1], electrodes=[value])
+    assert check_units_electrodes_look_like_group_numbers(units_table=nwbfile.units) is None
+
+
+def test_check_units_electrodes_look_like_group_numbers_contradicted_by_electrode_group_pass():
+    nwbfile, groups = _make_nwbfile_with_electrode_groups(n_groups=8)
+    for value in [0, 1, 4, 5, 8]:
+        nwbfile.add_unit(spike_times=[0.1], electrodes=[value], electrode_group=groups[value // 4])
+    assert check_units_electrodes_look_like_group_numbers(units_table=nwbfile.units) is None
+
+
+def test_check_units_electrodes_look_like_group_numbers_multiple_rows_per_unit_pass():
+    nwbfile, _ = _make_nwbfile_with_electrode_groups(n_groups=8)
+    for value in [1, 3, 4, 6]:
+        nwbfile.add_unit(spike_times=[0.1], electrodes=[value, value + 1])
+    assert check_units_electrodes_look_like_group_numbers(units_table=nwbfile.units) is None
+
+
+def test_check_units_electrodes_look_like_group_numbers_single_group_per_channel_labels_pass():
+    # One probe with numeric per-channel labels; units sit on the first channels of the probe.
+    nwbfile, _ = _make_nwbfile_with_electrode_groups(
+        group_names=["probe"], rows_per_group=64, labels=[str(row) for row in range(64)]
+    )
+    for value in [0, 3, 7, 12, 20, 31]:
+        nwbfile.add_unit(spike_times=[0.1], electrodes=[value])
+    assert check_units_electrodes_look_like_group_numbers(units_table=nwbfile.units) is None
+
+
+def test_check_units_electrodes_look_like_group_numbers_range_group_names_pass():
+    # Group names such as '1-8' hold channel ranges, not group numbers.
+    group_names = [f"{start}-{start + 7}" for start in range(1, 64, 8)]
+    nwbfile, _ = _make_nwbfile_with_electrode_groups(group_names=group_names, rows_per_group=8)  # 64 rows
+    for value in [2, 9, 17, 25, 33, 40]:
+        nwbfile.add_unit(spike_times=[0.1], electrodes=[value])
+    assert check_units_electrodes_look_like_group_numbers(units_table=nwbfile.units) is None
+
+
+def test_check_electrodes_identical_coordinate_columns_fail():
+    nwbfile, _ = _make_nwbfile_with_electrode_groups(coordinates=lambda row: (1.0, float(row), float(row)))
+    results = list(check_electrodes_identical_coordinate_columns(nwbfile=nwbfile))
+    assert results == [
+        InspectorMessage(
+            message=(
+                "The electrodes table's 'y' and 'z' columns are identical on all 16 rows, which suggests that one was "
+                "written in place of the other and one coordinate is missing."
+            ),
+            importance=Importance.CRITICAL,
+            check_function_name="check_electrodes_identical_coordinate_columns",
+            object_type="NWBFile",
+            object_name="root",
+            location="/",
+        )
+    ]
+
+
+def test_check_electrodes_identical_coordinate_columns_constant_or_nan_pass():
+    nwbfile, _ = _make_nwbfile_with_electrode_groups(coordinates=lambda row: (np.nan, np.nan, np.nan))
+    assert check_electrodes_identical_coordinate_columns(nwbfile=nwbfile) is None
+    nwbfile, _ = _make_nwbfile_with_electrode_groups(coordinates=lambda row: (0.0, 0.0, 0.0))
+    assert check_electrodes_identical_coordinate_columns(nwbfile=nwbfile) is None
+
+
+def test_check_electrodes_identical_coordinate_columns_pass():
+    nwbfile, _ = _make_nwbfile_with_electrode_groups()
+    assert check_electrodes_identical_coordinate_columns(nwbfile=nwbfile) is None
+
+
+def test_check_electrodes_placeholder_coordinates_fail():
+    nwbfile, _ = _make_nwbfile_with_electrode_groups(coordinates=lambda row: (0.0, 0.0, 0.0))
+    assert check_electrodes_placeholder_coordinates(nwbfile=nwbfile) == InspectorMessage(
+        message=(
+            "The electrodes table's x, y and z are 0 on all 16 rows. If the positions are unknown, use NaN (or omit "
+            "the columns) so that 0 is not read as a real coordinate."
+        ),
+        importance=Importance.BEST_PRACTICE_VIOLATION,
+        check_function_name="check_electrodes_placeholder_coordinates",
+        object_type="NWBFile",
+        object_name="root",
+        location="/",
+    )
+
+
+def test_check_electrodes_placeholder_coordinates_pass():
+    nwbfile, _ = _make_nwbfile_with_electrode_groups()
+    assert check_electrodes_placeholder_coordinates(nwbfile=nwbfile) is None
+    nwbfile, _ = _make_nwbfile_with_electrode_groups(coordinates=lambda row: (np.nan, np.nan, np.nan))
+    assert check_electrodes_placeholder_coordinates(nwbfile=nwbfile) is None
