@@ -25,6 +25,7 @@ Authors: Oliver Ruebel, Andrew Tritt, Ryan Ly, Cody Baker and Ben Dichter
    nwbfile_metadata
    time_series
    tables
+   duplicated_data
    behavior
    ecephys
    ophys

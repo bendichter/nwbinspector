@@ -5,6 +5,16 @@ from ._behavior import (
     check_spatial_series_radians_magnitude,
     check_spatial_series_unit,
 )
+from ._duplicates import (
+    check_identical_time_series,
+    check_redundant_time_series_copies,
+    check_table_duplicate_rows,
+    check_table_identical_columns,
+    check_table_ragged_times_repeated,
+    check_time_series_identical_columns,
+    check_timestamps_repeated,
+    check_units_identical_spike_trains,
+)
 from ._ecephys import (
     check_ascending_spike_times,
     check_electrical_series_dims,
@@ -212,4 +222,12 @@ __all__ = [
     "check_electrodes_location_allen_ccf",
     "check_intracellular_electrode_location_allen_ccf",
     "check_units_table_has_spikes",
+    "check_units_identical_spike_trains",
+    "check_table_duplicate_rows",
+    "check_identical_time_series",
+    "check_redundant_time_series_copies",
+    "check_table_identical_columns",
+    "check_time_series_identical_columns",
+    "check_table_ragged_times_repeated",
+    "check_timestamps_repeated",
 ]

@@ -1,3 +1,8 @@
+# Upcoming
+
+### New Checks
+* Added checks for data that are stored twice within one file, in a new `checks/_duplicates.py` module with a matching "Duplicated Data" best practices page: `check_units_identical_spike_trains` (units with identical spike trains, under the same or different ids), `check_table_duplicate_rows` (event-like rows repeated in every column, and per-row arrays repeated across rows), `check_identical_time_series` (identical series of different kinds, such as a processed series equal to its acquisition series), `check_redundant_time_series_copies` (identical series of the same kind that should be linked rather than copied), `check_table_identical_columns` and `check_time_series_identical_columns` (two columns holding the same values, such as `z` copying `y`), `check_table_ragged_times_repeated` (repeated times within a row of a ragged time column such as `event_times`), and `check_timestamps_repeated` (repeated TimeSeries timestamps). Large datasets are compared on sampled blocks, and the column comparison is aligned to HDF5 chunks and capped by `max_fetch_bytes` so that streamed files stay fast.
+
 # v0.7.2 (May 19, 2026)
 
 ### New Checks

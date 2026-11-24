@@ -24,6 +24,10 @@ Tables
 ------
 .. automodule:: nwbinspector.checks._tables
 
+Duplicated Data
+---------------
+.. automodule:: nwbinspector.checks._duplicates
+
 Behavior
 --------
 .. automodule:: nwbinspector.checks._behavior
